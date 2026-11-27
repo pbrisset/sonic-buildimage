@@ -1729,6 +1729,9 @@ static void fpm_read(struct event *t)
 		case RTM_DELNEIGH: {
 			struct ndmsg *ndm;
 
+			if (!zebra_mac_ext_learn_mode())
+				break;
+
 			if (hdr->nlmsg_len < NLMSG_LENGTH(sizeof(struct ndmsg))) {
 				zlog_warn("%s: [seq=%u] invalid neighbour message length %u",
 					  __func__, hdr->nlmsg_seq,
@@ -3699,17 +3702,19 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 
 	case DPLANE_OP_MAC_INSTALL:
 	case DPLANE_OP_MAC_DELETE:
-		/* FRR to SONiC: remote MACs only, which zebra learnt from BGP
-		 * EVPN. Local MACs come from SONiC and are not sent back.
-		 */
-		if (!CHECK_FLAG(dplane_ctx_mac_get_update_flags(ctx),
-				DPLANE_MAC_REMOTE))
-			return 0;
+		if (zebra_mac_ext_learn_mode()) {
+			/* Local MACs already came from SONiC over FPM. */
+			if (!CHECK_FLAG(dplane_ctx_mac_get_update_flags(ctx), DPLANE_MAC_REMOTE))
+				return 0;
 
-		rv = fpm_remote_mac_encode(ctx, nl_buf, sizeof(nl_buf));
+			rv = fpm_remote_mac_encode(ctx, nl_buf, sizeof(nl_buf));
+		} else {
+			/* Keep the existing MAC export, including L3VNI router MACs. */
+			rv = netlink_macfdb_update_ctx(ctx, nl_buf, sizeof(nl_buf));
+		}
 		if (rv <= 0) {
 			flog_err(EC_ZEBRA_FPM_ENCODE_FAIL,
-				 "%s: fpm_mac_encode failed", __func__);
+				 "%s: MAC encoding failed", __func__);
 			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_FAILURE);
 			return 0;
 		}
@@ -3934,8 +3939,9 @@ static int fpm_nl_enqueue(struct fpm_nl_ctx *fnc, struct zebra_dplane_ctx *ctx)
 	event_add_write(fnc->fthread->master, fpm_write, fnc, fnc->socket,
 			 &fnc->t_write);
 
-	/* Only remote MACs get this far. */
-	if (op == DPLANE_OP_MAC_INSTALL || op == DPLANE_OP_MAC_DELETE)
+	/* In external-learn mode, only remote MACs get this far. */
+	if ((op == DPLANE_OP_MAC_INSTALL || op == DPLANE_OP_MAC_DELETE) &&
+	    zebra_mac_ext_learn_mode())
 		fpm_pin_remote_queued(ctx);
 
 	return 0;
@@ -4180,10 +4186,12 @@ static void fpm_rmac_send(struct event *t)
 	/* RMAC walk completed. */
 	if (fra.complete) {
 		WALK_FINISH(fra.fnc, FNE_RMAC_FINISHED);
-		/* A retry left from before must not stand in for the replay. */
-		event_cancel(&fra.fnc->t_pinwalk);
-		event_add_event(zrouter.master, fpm_pin_replay, fra.fnc, 0,
-				&fra.fnc->t_pinwalk);
+		if (zebra_mac_ext_learn_mode()) {
+			/* A retry from an earlier connection cannot replace the replay. */
+			event_cancel(&fra.fnc->t_pinwalk);
+			event_add_event(zrouter.master, fpm_pin_replay, fra.fnc, 0,
+					&fra.fnc->t_pinwalk);
+		}
 	}
 }
 
@@ -4573,6 +4581,7 @@ static int fpm_nl_process(struct zebra_dplane_provider *prov)
 
 		if ((dplane_ctx_get_op(ctx) == DPLANE_OP_MAC_INSTALL ||
 		     dplane_ctx_get_op(ctx) == DPLANE_OP_MAC_DELETE) &&
+		    zebra_mac_ext_learn_mode() &&
 		    !CHECK_FLAG(dplane_ctx_mac_get_update_flags(ctx),
 				DPLANE_MAC_REMOTE))
 			fpm_kernel_mac_write(ctx);
@@ -4643,9 +4652,12 @@ static int fpm_nl_new(struct event_loop *tm)
 	if (IS_ZEBRA_DEBUG_DPLANE)
 		zlog_debug("%s register status: %d", prov_name, rv);
 
-	hook_register(zebra_dplane_mac_read, fpm_dplane_mac_read);
-	hook_register(zebra_dplane_mac_port_flush, fpm_dplane_mac_port_flush);
-	hook_register(zebra_dplane_mac_port_up, fpm_dplane_mac_port_up);
+	if (zebra_mac_ext_learn_mode()) {
+		hook_register(zebra_dplane_mac_read, fpm_dplane_mac_read);
+		hook_register(zebra_dplane_mac_port_flush, fpm_dplane_mac_port_flush);
+		hook_register(zebra_dplane_mac_port_up, fpm_dplane_mac_port_up);
+		zebra_neigh_set_dplane_mac_learning(true);
+	}
 
 	install_node(&fpm_node);
 	install_element(ENABLE_NODE, &fpm_show_status_cmd);
@@ -4658,10 +4670,6 @@ static int fpm_nl_new(struct event_loop *tm)
 	install_element(CONFIG_NODE, &no_fpm_use_nhg_cmd);
 	install_element(CONFIG_NODE, &fpm_use_route_replace_cmd);
 	install_element(CONFIG_NODE, &no_fpm_use_route_replace_cmd);
-
-	/* SONiC runs zebra in mac-ext-learn mode only to learn local MACs over FPM. */
-	if (zebra_mac_ext_learn_mode())
-		zebra_neigh_set_dplane_mac_learning(true);
 
 	return 0;
 }
